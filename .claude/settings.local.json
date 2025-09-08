@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm:*)",
+      "Bash(python manage.py:*)",
+      "Bash(curl:*)",
+      "Bash(npm install)",
+      "Bash(python test:*)",
+      "Bash(cat:*)"
+    ],
+    "deny": []
+  }
+}

@@ -1,0 +1,64 @@
+# ========================
+# PYTHON / DJANGO
+# ========================
+__pycache__/
+*.py[cod]
+*.sqlite3
+*.log
+*.pot
+*.pyc
+db.sqlite3
+media/
+staticfiles/
+local_settings.py
+.env
+venv/
+env/
+ENV/
+*.env
+*.DS_Store
+*.pyo
+*.pyd
+.mypy_cache/
+.pytest_cache/
+.idea/
+.vscode/
+
+# Django migrations
+**/migrations/
+!**/migrations/__init__.py
+
+# ========================
+# NODE / REACT
+# ========================
+# dependencies
+node_modules/
+Version 2/frontend/package-lock.json
+package-lock.json
+# production build
+build/
+dist/
+
+# misc
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp.*
+.pnp.js
+.cache/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDEs and editors
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+
+# Mac system files
+.DS_Store
+
+# Windows system files
+Thumbs.db
+ehthumbs.db

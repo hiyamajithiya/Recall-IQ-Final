@@ -1,0 +1,1191 @@
+from rest_framework import generics, status, viewsets, mixins
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.response import Response
+from rest_framework.permissions import IsAuthenticated
+from django.db import transaction
+from django.http import HttpResponse
+import openpyxl
+from openpyxl.styles import Font, PatternFill
+from io import BytesIO
+from core.permissions import IsSuperAdmin, IsTenantAdmin, IsTenantOwner, IsTenantMember
+from .models import Tenant, TenantEmail, TenantMailSecret, Group, GroupEmail
+from .serializers import (
+    TenantSerializer, TenantEmailSerializer, TenantMailSecretSerializer,
+    GroupSerializer, GroupEmailSerializer, GroupEmailModelSerializer, 
+    BulkEmailUploadSerializer, ExcelUploadSerializer
+)
+from batches.models import Batch
+from batches.serializers import BatchSerializer, BatchCreateSerializer, BatchActionSerializer
+from .signals import manual_notify_trial_expiry, manual_notify_subscription_renewal
+from core.tenant_notifications import send_tenant_notification
+
+
+class TenantViewSet(viewsets.ModelViewSet):
+    serializer_class = TenantSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        # Use defer to exclude the domain field since it was removed from model
+        if self.request.user.role == 'super_admin':
+            return Tenant.objects.all()
+        elif self.request.user.tenant:
+            return Tenant.objects.filter(id=self.request.user.tenant.id)
+        return Tenant.objects.none()
+    
+    def get_permissions(self):
+        if self.action in ['create', 'destroy']:
+            return [IsSuperAdmin()]
+        elif self.action in ['update', 'partial_update']:
+            return [IsTenantAdmin(), IsTenantOwner()]
+        elif self.action in ['send_trial_expiry_notification', 'send_renewal_notification', 'send_custom_notification']:
+            return [IsSuperAdmin()]
+        return [IsTenantMember()]
+    
+    def perform_update(self, serializer):
+        """Override to track who made the changes for notifications"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Store the user who made the change for notification purposes
+        instance = serializer.instance
+        instance._changed_by = self.request.user
+        
+        logger.info(f"🔧 perform_update called for tenant {instance.name} by {self.request.user.username}")
+        logger.info(f"🔧 Setting _changed_by to: {instance._changed_by}")
+        
+        result = serializer.save()
+        
+        logger.info(f"🔧 serializer.save() completed")
+        return result
+    
+    @action(detail=True, methods=['post'])
+    def send_trial_expiry_notification(self, request, pk=None):
+        """Manually send trial expiry notification to tenant"""
+        try:
+            tenant = self.get_object()
+            result = manual_notify_trial_expiry(tenant.id, request.user)
+            
+            if result:
+                return Response({
+                    'message': f'Trial expiry notification sent successfully to {tenant.name}',
+                    'tenant_id': tenant.id,
+                    'tenant_name': tenant.name
+                })
+            else:
+                return Response({
+                    'error': 'Failed to send trial expiry notification'
+                }, status=status.HTTP_400_BAD_REQUEST)
+                
+        except Exception as e:
+            return Response({
+                'error': f'Error sending notification: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=True, methods=['post'])
+    def send_renewal_notification(self, request, pk=None):
+        """Manually send subscription renewal notification to tenant"""
+        try:
+            tenant = self.get_object()
+            result = manual_notify_subscription_renewal(tenant.id, request.user)
+            
+            if result:
+                return Response({
+                    'message': f'Subscription renewal notification sent successfully to {tenant.name}',
+                    'tenant_id': tenant.id,
+                    'tenant_name': tenant.name
+                })
+            else:
+                return Response({
+                    'error': 'Failed to send renewal notification'
+                }, status=status.HTTP_400_BAD_REQUEST)
+                
+        except Exception as e:
+            return Response({
+                'error': f'Error sending notification: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=True, methods=['post'])
+    def send_custom_notification(self, request, pk=None):
+        """Send custom notification to tenant"""
+        try:
+            tenant = self.get_object()
+            notification_type = request.data.get('type', 'generic_update')
+            changes = request.data.get('changes', {})
+            
+            result = send_tenant_notification(tenant, notification_type, changes, request.user)
+            
+            if result:
+                return Response({
+                    'message': f'Custom notification sent successfully to {tenant.name}',
+                    'tenant_id': tenant.id,
+                    'tenant_name': tenant.name,
+                    'notification_type': notification_type
+                })
+            else:
+                return Response({
+                    'error': 'Failed to send custom notification'
+                }, status=status.HTTP_400_BAD_REQUEST)
+                
+        except Exception as e:
+            return Response({
+                'error': f'Error sending notification: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+
+class TenantEmailViewSet(viewsets.ModelViewSet):
+    serializer_class = TenantEmailSerializer
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    
+    def get_queryset(self):
+        if self.request.user.role == 'super_admin':
+            return TenantEmail.objects.all()
+        elif self.request.user.tenant:
+            return TenantEmail.objects.filter(tenant=self.request.user.tenant)
+        return TenantEmail.objects.none()
+    
+    def perform_create(self, serializer):
+        if self.request.user.role != 'super_admin':
+            serializer.save(tenant=self.request.user.tenant)
+        else:
+            serializer.save()
+
+
+class TenantMailSecretViewSet(viewsets.ModelViewSet):
+    serializer_class = TenantMailSecretSerializer
+    permission_classes = [IsAuthenticated, IsTenantAdmin]
+    
+    def get_queryset(self):
+        if self.request.user.role == 'super_admin':
+            return TenantMailSecret.objects.all()
+        elif self.request.user.tenant:
+            return TenantMailSecret.objects.filter(tenant_email__tenant=self.request.user.tenant)
+        return TenantMailSecret.objects.none()
+
+
+# Admin ViewSet for tenant-admin (full CRUD access)
+class TenantAdminGroupViewSet(viewsets.ModelViewSet):
+    queryset = Group.objects.all()
+    serializer_class = GroupSerializer
+    permission_classes = [IsAuthenticated, IsTenantAdmin]
+    
+    def get_queryset(self):
+        if self.request.user.role == 'super_admin':
+            return Group.objects.all()
+        elif self.request.user.tenant:
+            return Group.objects.filter(tenant=self.request.user.tenant)
+        return Group.objects.none()
+    
+    def perform_create(self, serializer):
+        if self.request.user.role != 'super_admin':
+            if not self.request.user.tenant:
+                from rest_framework import serializers as rest_serializers
+                raise rest_serializers.ValidationError("User must belong to a tenant")
+            serializer.save(tenant=self.request.user.tenant)
+        else:
+            # Super admin must specify a tenant when creating groups
+            tenant_id = self.request.data.get('tenant')
+            if not tenant_id:
+                from rest_framework import serializers as rest_serializers
+                raise rest_serializers.ValidationError("Super admin must specify a tenant when creating groups")
+            from .models import Tenant
+            try:
+                tenant = Tenant.objects.get(id=tenant_id)
+                serializer.save(tenant=tenant)
+            except Tenant.DoesNotExist:
+                from rest_framework import serializers as rest_serializers
+                raise rest_serializers.ValidationError("Invalid tenant specified")
+    
+    @action(detail=True, methods=['post'])
+    def bulk_add_emails(self, request, pk=None):
+        group = self.get_object()
+        serializer = BulkEmailUploadSerializer(data=request.data)
+        
+        if serializer.is_valid():
+            contacts = serializer.validated_data['contacts']
+            
+            created_count = 0
+            duplicate_count = 0
+            
+            with transaction.atomic():
+                for contact in contacts:
+                    email = contact['email']
+                    name = contact.get('name', '')
+                    
+                    group_email, created = GroupEmail.objects.get_or_create(
+                        group=group,
+                        email=email,
+                        defaults={
+                            'name': name
+                        }
+                    )
+                    
+                    if created:
+                        created_count += 1
+                    else:
+                        duplicate_count += 1
+            
+            return Response({
+                'message': f'Added {created_count} emails successfully',
+                'created': created_count,
+                'duplicates': duplicate_count
+            })
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=True, methods=['post'])
+    def upload_excel(self, request, pk=None):
+        group = self.get_object()
+        serializer = ExcelUploadSerializer(data=request.data)
+        
+        if serializer.is_valid():
+            contacts = serializer.validated_data['file']
+            
+            created_count = 0
+            duplicate_count = 0
+            
+            with transaction.atomic():
+                for contact in contacts:
+                    email = contact['email']
+                    name = contact.get('name', '')
+                    
+                    group_email, created = GroupEmail.objects.get_or_create(
+                        group=group,
+                        email=email,
+                        defaults={
+                            'name': name
+                        }
+                    )
+                    
+                    if created:
+                        created_count += 1
+                    else:
+                        duplicate_count += 1
+            
+            return Response({
+                'message': f'Added {created_count} emails successfully from Excel file',
+                'created': created_count,
+                'duplicates': duplicate_count
+            })
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    @action(detail=True, methods=['delete'])
+    def bulk_remove_emails(self, request, pk=None):
+        group = self.get_object()
+        emails = request.data.get('emails', [])
+        
+        if not emails:
+            return Response({'error': 'No emails provided'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        deleted_count = GroupEmail.objects.filter(
+            group=group,
+            email__in=emails
+        ).delete()[0]
+        
+        return Response({
+            'message': f'Removed {deleted_count} emails successfully',
+            'deleted': deleted_count
+        })
+    
+    @action(detail=False, methods=['get'])
+    def download_excel_template(self, request):
+        """Download Excel template for bulk email upload"""
+        # Create a new workbook and select the active sheet
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Email Template"
+        
+        # Define headers
+        headers = ['Email', 'Name', 'Organization']
+        
+        # Set up header styling
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        
+        # Add headers with styling
+        for col_num, header in enumerate(headers, 1):
+            cell = worksheet.cell(row=1, column=col_num, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+        
+        # Add instruction row for users
+        instruction_data = [
+            'Enter email addresses here', 'Enter contact names here', 'Enter company/organization names here'
+        ]
+        
+        for col_num, instruction in enumerate(instruction_data, 1):
+            cell = worksheet.cell(row=2, column=col_num, value=instruction)
+            cell.font = Font(italic=True, color="666666")
+        
+        # Auto-adjust column widths
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
+        
+        # Create HTTP response with Excel file
+        output = BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        
+        response = HttpResponse(
+            output.read(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = 'attachment; filename="email_template.xlsx"'
+        
+        return response
+
+# Staff ViewSet for tenant-staff (read-only access)
+class TenantStaffGroupViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Group.objects.all()
+    serializer_class = GroupSerializer
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    
+    def get_queryset(self):
+        if self.request.user.role == 'super_admin':
+            return Group.objects.all()
+        elif self.request.user.tenant:
+            return Group.objects.filter(tenant=self.request.user.tenant)
+        return Group.objects.none()
+
+# Legacy GroupViewSet for backward compatibility (will be deprecated)
+class GroupViewSet(viewsets.ModelViewSet):
+    queryset = Group.objects.all()
+    serializer_class = GroupSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        if self.request.user.role == 'super_admin':
+            return Group.objects.all()
+        elif self.request.user.tenant:
+            return Group.objects.filter(tenant=self.request.user.tenant)
+        return Group.objects.none()
+    
+    def perform_create(self, serializer):
+        if self.request.user.role != 'super_admin':
+            if not self.request.user.tenant:
+                from rest_framework import serializers as rest_serializers
+                raise rest_serializers.ValidationError("User must belong to a tenant")
+            serializer.save(tenant=self.request.user.tenant)
+        else:
+            serializer.save()
+
+
+# Admin GroupEmail ViewSet for tenant-admin (full CRUD access)
+class TenantAdminGroupEmailViewSet(viewsets.ModelViewSet):
+    serializer_class = GroupEmailModelSerializer
+    permission_classes = [IsAuthenticated, IsTenantAdmin]
+    
+    def get_queryset(self):
+        # First apply tenant filtering
+        if self.request.user.role == 'super_admin':
+            queryset = GroupEmail.objects.all()
+        elif self.request.user.tenant:
+            queryset = GroupEmail.objects.filter(group__tenant=self.request.user.tenant)
+        else:
+            queryset = GroupEmail.objects.none()
+        
+        # Then apply group filtering if group parameter is provided
+        group_id = self.request.query_params.get('group', None)
+        if group_id:
+            queryset = queryset.filter(group_id=group_id)
+        
+        return queryset
+
+
+# Role-based Batch ViewSets
+class TenantAdminBatchViewSet(viewsets.ModelViewSet):
+    """Batch ViewSet for tenant admin and sales team (full access)"""
+    serializer_class = BatchSerializer
+    permission_classes = [IsAuthenticated, IsTenantAdmin]
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return BatchCreateSerializer
+        return BatchSerializer
+    
+    def get_queryset(self):
+        queryset = Batch.objects.select_related('tenant', 'template').prefetch_related('batch_groups__group')
+        
+        if self.request.user.role == 'super_admin':
+            return queryset
+        elif self.request.user.tenant:
+            queryset = queryset.filter(tenant=self.request.user.tenant)
+        else:
+            return Batch.objects.none()
+        
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        search = self.request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
+        
+        return queryset.order_by('-created_at')
+    
+    def perform_create(self, serializer):
+        serializer.save(tenant=self.request.user.tenant)
+
+    @action(detail=True, methods=['post'])
+    def execute_action(self, request, pk=None):
+        """Execute batch actions like start, pause, resume, cancel"""
+        batch = self.get_object()
+        serializer = BatchActionSerializer(data=request.data, context={'batch': batch})
+        
+        if serializer.is_valid():
+            from django.utils import timezone
+            from batches.tasks import send_batch_emails
+            
+            action_type = serializer.validated_data['action']
+            
+            if action_type == 'start':
+                batch.status = 'scheduled'
+                if batch.start_time <= timezone.now():
+                    send_batch_emails.delay(batch.id)
+                
+            elif action_type == 'pause':
+                batch.status = 'paused'
+                
+            elif action_type == 'resume':
+                batch.status = 'scheduled'
+                if batch.start_time <= timezone.now():
+                    send_batch_emails.delay(batch.id)
+                
+            elif action_type == 'cancel':
+                batch.status = 'cancelled'
+            
+            batch.save()
+            
+            return Response({
+                'message': f'Batch {action_type}ed successfully',
+                'status': batch.status
+            })
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['get'])
+    def recipients(self, request, pk=None):
+        """Get all recipients for a batch with their document status"""
+        from batches.serializers import BatchRecipientSerializer
+        
+        batch = self.get_object()
+        queryset = batch.batch_recipients.all()
+        
+        # Filtering
+        documents_received = request.query_params.get('documents_received')
+        if documents_received is not None:
+            queryset = queryset.filter(documents_received=documents_received.lower() == 'true')
+        
+        email_sent = request.query_params.get('email_sent')
+        if email_sent is not None:
+            queryset = queryset.filter(email_sent=email_sent.lower() == 'true')
+        
+        # Search
+        search = request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(recipient__name__icontains=search) |
+                Q(recipient__email__icontains=search) |
+                Q(recipient__organization_name__icontains=search)
+            )
+        
+        page = self.paginate_queryset(queryset)
+        serializer = BatchRecipientSerializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        """Get batch statistics"""
+        batch = self.get_object()
+        
+        total_recipients = batch.total_recipients
+        emails_sent = batch.emails_sent
+        emails_failed = batch.emails_failed
+        pending = total_recipients - emails_sent - emails_failed
+        
+        stats = {
+            'total_recipients': total_recipients,
+            'emails_sent': emails_sent,
+            'emails_failed': emails_failed,
+            'emails_pending': pending,
+            'success_rate': (emails_sent / total_recipients * 100) if total_recipients > 0 else 0,
+            'completion_rate': ((emails_sent + emails_failed) / total_recipients * 100) if total_recipients > 0 else 0
+        }
+        
+        return Response(stats)
+
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """Get dashboard statistics for batches"""
+        queryset = self.get_queryset()
+        
+        stats = {
+            'total_batches': queryset.count(),
+            'active_batches': queryset.filter(status__in=['scheduled', 'running']).count(),
+            'completed_batches': queryset.filter(status='completed').count(),
+            'failed_batches': queryset.filter(status='failed').count(),
+            'total_emails_sent': sum(batch.emails_sent for batch in queryset),
+            'total_emails_failed': sum(batch.emails_failed for batch in queryset),
+        }
+        
+        recent_batches = queryset[:5]
+        stats['recent_batches'] = BatchSerializer(recent_batches, many=True).data
+        
+        return Response(stats)
+
+
+class TenantStaffBatchViewSet(viewsets.ReadOnlyModelViewSet):
+    """Batch ViewSet for staff admin and staff (read-only access)"""
+    serializer_class = BatchSerializer
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    
+    def get_queryset(self):
+        queryset = Batch.objects.select_related('tenant', 'template').prefetch_related('batch_groups__group')
+        
+        if self.request.user.role == 'super_admin':
+            return queryset
+        elif self.request.user.tenant:
+            queryset = queryset.filter(tenant=self.request.user.tenant)
+        else:
+            return Batch.objects.none()
+        
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        search = self.request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
+        
+        return queryset.order_by('-created_at')
+
+    @action(detail=True, methods=['get'])
+    def recipients(self, request, pk=None):
+        """Get all recipients for a batch with their document status (read-only)"""
+        from batches.serializers import BatchRecipientSerializer
+        
+        batch = self.get_object()
+        queryset = batch.batch_recipients.all()
+        
+        # Filtering
+        documents_received = request.query_params.get('documents_received')
+        if documents_received is not None:
+            queryset = queryset.filter(documents_received=documents_received.lower() == 'true')
+        
+        email_sent = request.query_params.get('email_sent')
+        if email_sent is not None:
+            queryset = queryset.filter(email_sent=email_sent.lower() == 'true')
+        
+        # Search
+        search = request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(recipient__name__icontains=search) |
+                Q(recipient__email__icontains=search) |
+                Q(recipient__organization_name__icontains=search)
+            )
+        
+        page = self.paginate_queryset(queryset)
+        serializer = BatchRecipientSerializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        """Get batch statistics (read-only)"""
+        batch = self.get_object()
+        
+        total_recipients = batch.total_recipients
+        emails_sent = batch.emails_sent
+        emails_failed = batch.emails_failed
+        pending = total_recipients - emails_sent - emails_failed
+        
+        stats = {
+            'total_recipients': total_recipients,
+            'emails_sent': emails_sent,
+            'emails_failed': emails_failed,
+            'emails_pending': pending,
+            'success_rate': (emails_sent / total_recipients * 100) if total_recipients > 0 else 0,
+            'completion_rate': ((emails_sent + emails_failed) / total_recipients * 100) if total_recipients > 0 else 0
+        }
+        
+        return Response(stats)
+
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """Get dashboard statistics for batches (read-only)"""
+        queryset = self.get_queryset()
+        
+        stats = {
+            'total_batches': queryset.count(),
+            'active_batches': queryset.filter(status__in=['scheduled', 'running']).count(),
+            'completed_batches': queryset.filter(status='completed').count(),
+            'failed_batches': queryset.filter(status='failed').count(),
+            'total_emails_sent': sum(batch.emails_sent for batch in queryset),
+            'total_emails_failed': sum(batch.emails_failed for batch in queryset),
+        }
+        
+        recent_batches = queryset[:5]
+        stats['recent_batches'] = BatchSerializer(recent_batches, many=True).data
+        
+        return Response(stats)
+    
+    def perform_create(self, serializer):
+        if self.request.user.role != 'super_admin':
+            # Ensure the group belongs to the user's tenant
+            group = serializer.validated_data['group']
+            if group.tenant != self.request.user.tenant:
+                from rest_framework import serializers as rest_serializers
+                raise rest_serializers.ValidationError("Group does not belong to your tenant")
+        serializer.save()
+
+# Staff GroupEmail ViewSet for tenant-staff (read-only access)
+class TenantStaffGroupEmailViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = GroupEmailModelSerializer
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    
+    def get_queryset(self):
+        # First apply tenant filtering
+        if self.request.user.role == 'super_admin':
+            queryset = GroupEmail.objects.all()
+        elif self.request.user.tenant:
+            queryset = GroupEmail.objects.filter(group__tenant=self.request.user.tenant)
+        else:
+            queryset = GroupEmail.objects.none()
+        
+        # Then apply group filtering if group parameter is provided
+        group_id = self.request.query_params.get('group', None)
+        if group_id:
+            queryset = queryset.filter(group_id=group_id)
+        
+        return queryset
+
+
+# Role-based Batch ViewSets
+class TenantAdminBatchViewSet(viewsets.ModelViewSet):
+    """Batch ViewSet for tenant admin and sales team (full access)"""
+    serializer_class = BatchSerializer
+    permission_classes = [IsAuthenticated, IsTenantAdmin]
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return BatchCreateSerializer
+        return BatchSerializer
+    
+    def get_queryset(self):
+        queryset = Batch.objects.select_related('tenant', 'template').prefetch_related('batch_groups__group')
+        
+        if self.request.user.role == 'super_admin':
+            return queryset
+        elif self.request.user.tenant:
+            queryset = queryset.filter(tenant=self.request.user.tenant)
+        else:
+            return Batch.objects.none()
+        
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        search = self.request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
+        
+        return queryset.order_by('-created_at')
+    
+    def perform_create(self, serializer):
+        serializer.save(tenant=self.request.user.tenant)
+
+    @action(detail=True, methods=['post'])
+    def execute_action(self, request, pk=None):
+        """Execute batch actions like start, pause, resume, cancel"""
+        batch = self.get_object()
+        serializer = BatchActionSerializer(data=request.data, context={'batch': batch})
+        
+        if serializer.is_valid():
+            from django.utils import timezone
+            from batches.tasks import send_batch_emails
+            
+            action_type = serializer.validated_data['action']
+            
+            if action_type == 'start':
+                batch.status = 'scheduled'
+                if batch.start_time <= timezone.now():
+                    send_batch_emails.delay(batch.id)
+                
+            elif action_type == 'pause':
+                batch.status = 'paused'
+                
+            elif action_type == 'resume':
+                batch.status = 'scheduled'
+                if batch.start_time <= timezone.now():
+                    send_batch_emails.delay(batch.id)
+                
+            elif action_type == 'cancel':
+                batch.status = 'cancelled'
+            
+            batch.save()
+            
+            return Response({
+                'message': f'Batch {action_type}ed successfully',
+                'status': batch.status
+            })
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['get'])
+    def recipients(self, request, pk=None):
+        """Get all recipients for a batch with their document status"""
+        from batches.serializers import BatchRecipientSerializer
+        
+        batch = self.get_object()
+        queryset = batch.batch_recipients.all()
+        
+        # Filtering
+        documents_received = request.query_params.get('documents_received')
+        if documents_received is not None:
+            queryset = queryset.filter(documents_received=documents_received.lower() == 'true')
+        
+        email_sent = request.query_params.get('email_sent')
+        if email_sent is not None:
+            queryset = queryset.filter(email_sent=email_sent.lower() == 'true')
+        
+        # Search
+        search = request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(recipient__name__icontains=search) |
+                Q(recipient__email__icontains=search) |
+                Q(recipient__organization_name__icontains=search)
+            )
+        
+        page = self.paginate_queryset(queryset)
+        serializer = BatchRecipientSerializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        """Get batch statistics"""
+        batch = self.get_object()
+        
+        total_recipients = batch.total_recipients
+        emails_sent = batch.emails_sent
+        emails_failed = batch.emails_failed
+        pending = total_recipients - emails_sent - emails_failed
+        
+        stats = {
+            'total_recipients': total_recipients,
+            'emails_sent': emails_sent,
+            'emails_failed': emails_failed,
+            'emails_pending': pending,
+            'success_rate': (emails_sent / total_recipients * 100) if total_recipients > 0 else 0,
+            'completion_rate': ((emails_sent + emails_failed) / total_recipients * 100) if total_recipients > 0 else 0
+        }
+        
+        return Response(stats)
+
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """Get dashboard statistics for batches"""
+        queryset = self.get_queryset()
+        
+        stats = {
+            'total_batches': queryset.count(),
+            'active_batches': queryset.filter(status__in=['scheduled', 'running']).count(),
+            'completed_batches': queryset.filter(status='completed').count(),
+            'failed_batches': queryset.filter(status='failed').count(),
+            'total_emails_sent': sum(batch.emails_sent for batch in queryset),
+            'total_emails_failed': sum(batch.emails_failed for batch in queryset),
+        }
+        
+        recent_batches = queryset[:5]
+        stats['recent_batches'] = BatchSerializer(recent_batches, many=True).data
+        
+        return Response(stats)
+
+
+class TenantStaffBatchViewSet(viewsets.ReadOnlyModelViewSet):
+    """Batch ViewSet for staff admin and staff (read-only access)"""
+    serializer_class = BatchSerializer
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    
+    def get_queryset(self):
+        queryset = Batch.objects.select_related('tenant', 'template').prefetch_related('batch_groups__group')
+        
+        if self.request.user.role == 'super_admin':
+            return queryset
+        elif self.request.user.tenant:
+            queryset = queryset.filter(tenant=self.request.user.tenant)
+        else:
+            return Batch.objects.none()
+        
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        search = self.request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
+        
+        return queryset.order_by('-created_at')
+
+    @action(detail=True, methods=['get'])
+    def recipients(self, request, pk=None):
+        """Get all recipients for a batch with their document status (read-only)"""
+        from batches.serializers import BatchRecipientSerializer
+        
+        batch = self.get_object()
+        queryset = batch.batch_recipients.all()
+        
+        # Filtering
+        documents_received = request.query_params.get('documents_received')
+        if documents_received is not None:
+            queryset = queryset.filter(documents_received=documents_received.lower() == 'true')
+        
+        email_sent = request.query_params.get('email_sent')
+        if email_sent is not None:
+            queryset = queryset.filter(email_sent=email_sent.lower() == 'true')
+        
+        # Search
+        search = request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(recipient__name__icontains=search) |
+                Q(recipient__email__icontains=search) |
+                Q(recipient__organization_name__icontains=search)
+            )
+        
+        page = self.paginate_queryset(queryset)
+        serializer = BatchRecipientSerializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        """Get batch statistics (read-only)"""
+        batch = self.get_object()
+        
+        total_recipients = batch.total_recipients
+        emails_sent = batch.emails_sent
+        emails_failed = batch.emails_failed
+        pending = total_recipients - emails_sent - emails_failed
+        
+        stats = {
+            'total_recipients': total_recipients,
+            'emails_sent': emails_sent,
+            'emails_failed': emails_failed,
+            'emails_pending': pending,
+            'success_rate': (emails_sent / total_recipients * 100) if total_recipients > 0 else 0,
+            'completion_rate': ((emails_sent + emails_failed) / total_recipients * 100) if total_recipients > 0 else 0
+        }
+        
+        return Response(stats)
+
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """Get dashboard statistics for batches (read-only)"""
+        queryset = self.get_queryset()
+        
+        stats = {
+            'total_batches': queryset.count(),
+            'active_batches': queryset.filter(status__in=['scheduled', 'running']).count(),
+            'completed_batches': queryset.filter(status='completed').count(),
+            'failed_batches': queryset.filter(status='failed').count(),
+            'total_emails_sent': sum(batch.emails_sent for batch in queryset),
+            'total_emails_failed': sum(batch.emails_failed for batch in queryset),
+        }
+        
+        recent_batches = queryset[:5]
+        stats['recent_batches'] = BatchSerializer(recent_batches, many=True).data
+        
+        return Response(stats)
+
+# Legacy GroupEmail ViewSet for backward compatibility
+class GroupEmailViewSet(viewsets.ModelViewSet):
+    serializer_class = GroupEmailModelSerializer
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    
+    def get_queryset(self):
+        # First apply tenant filtering
+        if self.request.user.role == 'super_admin':
+            queryset = GroupEmail.objects.all()
+        elif self.request.user.tenant:
+            queryset = GroupEmail.objects.filter(group__tenant=self.request.user.tenant)
+        else:
+            queryset = GroupEmail.objects.none()
+        
+        # Then apply group filtering if group parameter is provided
+        group_id = self.request.query_params.get('group', None)
+        if group_id:
+            queryset = queryset.filter(group_id=group_id)
+        
+        return queryset
+
+
+# Role-based Batch ViewSets
+class TenantAdminBatchViewSet(viewsets.ModelViewSet):
+    """Batch ViewSet for tenant admin and sales team (full access)"""
+    serializer_class = BatchSerializer
+    permission_classes = [IsAuthenticated, IsTenantAdmin]
+    
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return BatchCreateSerializer
+        return BatchSerializer
+    
+    def get_queryset(self):
+        queryset = Batch.objects.select_related('tenant', 'template').prefetch_related('batch_groups__group')
+        
+        if self.request.user.role == 'super_admin':
+            return queryset
+        elif self.request.user.tenant:
+            queryset = queryset.filter(tenant=self.request.user.tenant)
+        else:
+            return Batch.objects.none()
+        
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        search = self.request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
+        
+        return queryset.order_by('-created_at')
+    
+    def perform_create(self, serializer):
+        serializer.save(tenant=self.request.user.tenant)
+
+    @action(detail=True, methods=['post'])
+    def execute_action(self, request, pk=None):
+        """Execute batch actions like start, pause, resume, cancel"""
+        batch = self.get_object()
+        serializer = BatchActionSerializer(data=request.data, context={'batch': batch})
+        
+        if serializer.is_valid():
+            from django.utils import timezone
+            from batches.tasks import send_batch_emails
+            
+            action_type = serializer.validated_data['action']
+            
+            if action_type == 'start':
+                batch.status = 'scheduled'
+                if batch.start_time <= timezone.now():
+                    send_batch_emails.delay(batch.id)
+                
+            elif action_type == 'pause':
+                batch.status = 'paused'
+                
+            elif action_type == 'resume':
+                batch.status = 'scheduled'
+                if batch.start_time <= timezone.now():
+                    send_batch_emails.delay(batch.id)
+                
+            elif action_type == 'cancel':
+                batch.status = 'cancelled'
+            
+            batch.save()
+            
+            return Response({
+                'message': f'Batch {action_type}ed successfully',
+                'status': batch.status
+            })
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['get'])
+    def recipients(self, request, pk=None):
+        """Get all recipients for a batch with their document status"""
+        from batches.serializers import BatchRecipientSerializer
+        
+        batch = self.get_object()
+        queryset = batch.batch_recipients.all()
+        
+        # Filtering
+        documents_received = request.query_params.get('documents_received')
+        if documents_received is not None:
+            queryset = queryset.filter(documents_received=documents_received.lower() == 'true')
+        
+        email_sent = request.query_params.get('email_sent')
+        if email_sent is not None:
+            queryset = queryset.filter(email_sent=email_sent.lower() == 'true')
+        
+        # Search
+        search = request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(recipient__name__icontains=search) |
+                Q(recipient__email__icontains=search) |
+                Q(recipient__organization_name__icontains=search)
+            )
+        
+        page = self.paginate_queryset(queryset)
+        serializer = BatchRecipientSerializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        """Get batch statistics"""
+        batch = self.get_object()
+        
+        total_recipients = batch.total_recipients
+        emails_sent = batch.emails_sent
+        emails_failed = batch.emails_failed
+        pending = total_recipients - emails_sent - emails_failed
+        
+        stats = {
+            'total_recipients': total_recipients,
+            'emails_sent': emails_sent,
+            'emails_failed': emails_failed,
+            'emails_pending': pending,
+            'success_rate': (emails_sent / total_recipients * 100) if total_recipients > 0 else 0,
+            'completion_rate': ((emails_sent + emails_failed) / total_recipients * 100) if total_recipients > 0 else 0
+        }
+        
+        return Response(stats)
+
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """Get dashboard statistics for batches"""
+        queryset = self.get_queryset()
+        
+        stats = {
+            'total_batches': queryset.count(),
+            'active_batches': queryset.filter(status__in=['scheduled', 'running']).count(),
+            'completed_batches': queryset.filter(status='completed').count(),
+            'failed_batches': queryset.filter(status='failed').count(),
+            'total_emails_sent': sum(batch.emails_sent for batch in queryset),
+            'total_emails_failed': sum(batch.emails_failed for batch in queryset),
+        }
+        
+        recent_batches = queryset[:5]
+        stats['recent_batches'] = BatchSerializer(recent_batches, many=True).data
+        
+        return Response(stats)
+
+
+class TenantStaffBatchViewSet(viewsets.ReadOnlyModelViewSet):
+    """Batch ViewSet for staff admin and staff (read-only access)"""
+    serializer_class = BatchSerializer
+    permission_classes = [IsAuthenticated, IsTenantMember]
+    
+    def get_queryset(self):
+        queryset = Batch.objects.select_related('tenant', 'template').prefetch_related('batch_groups__group')
+        
+        if self.request.user.role == 'super_admin':
+            return queryset
+        elif self.request.user.tenant:
+            queryset = queryset.filter(tenant=self.request.user.tenant)
+        else:
+            return Batch.objects.none()
+        
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        search = self.request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(name__icontains=search) | Q(description__icontains=search)
+            )
+        
+        return queryset.order_by('-created_at')
+
+    @action(detail=True, methods=['get'])
+    def recipients(self, request, pk=None):
+        """Get all recipients for a batch with their document status (read-only)"""
+        from batches.serializers import BatchRecipientSerializer
+        
+        batch = self.get_object()
+        queryset = batch.batch_recipients.all()
+        
+        # Filtering
+        documents_received = request.query_params.get('documents_received')
+        if documents_received is not None:
+            queryset = queryset.filter(documents_received=documents_received.lower() == 'true')
+        
+        email_sent = request.query_params.get('email_sent')
+        if email_sent is not None:
+            queryset = queryset.filter(email_sent=email_sent.lower() == 'true')
+        
+        # Search
+        search = request.query_params.get('search')
+        if search:
+            from django.db.models import Q
+            queryset = queryset.filter(
+                Q(recipient__name__icontains=search) |
+                Q(recipient__email__icontains=search) |
+                Q(recipient__organization_name__icontains=search)
+            )
+        
+        page = self.paginate_queryset(queryset)
+        serializer = BatchRecipientSerializer(page, many=True)
+        return self.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=['get'])
+    def statistics(self, request, pk=None):
+        """Get batch statistics (read-only)"""
+        batch = self.get_object()
+        
+        total_recipients = batch.total_recipients
+        emails_sent = batch.emails_sent
+        emails_failed = batch.emails_failed
+        pending = total_recipients - emails_sent - emails_failed
+        
+        stats = {
+            'total_recipients': total_recipients,
+            'emails_sent': emails_sent,
+            'emails_failed': emails_failed,
+            'emails_pending': pending,
+            'success_rate': (emails_sent / total_recipients * 100) if total_recipients > 0 else 0,
+            'completion_rate': ((emails_sent + emails_failed) / total_recipients * 100) if total_recipients > 0 else 0
+        }
+        
+        return Response(stats)
+
+    @action(detail=False, methods=['get'])
+    def dashboard_stats(self, request):
+        """Get dashboard statistics for batches (read-only)"""
+        queryset = self.get_queryset()
+        
+        stats = {
+            'total_batches': queryset.count(),
+            'active_batches': queryset.filter(status__in=['scheduled', 'running']).count(),
+            'completed_batches': queryset.filter(status='completed').count(),
+            'failed_batches': queryset.filter(status='failed').count(),
+            'total_emails_sent': sum(batch.emails_sent for batch in queryset),
+            'total_emails_failed': sum(batch.emails_failed for batch in queryset),
+        }
+        
+        recent_batches = queryset[:5]
+        stats['recent_batches'] = BatchSerializer(recent_batches, many=True).data
+        
+        return Response(stats)
