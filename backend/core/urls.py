@@ -28,7 +28,9 @@ from .views import (
     get_available_user_roles,
     get_tenant_email_configurations,
     health_check,
-    detailed_health_check
+    detailed_health_check,
+    admin_redirect_view,
+    admin_login_redirect_view
 )
 from .dashboard_views import tenant_dashboard
 from .views_recipients import ContactGroupViewSet, RecipientViewSet

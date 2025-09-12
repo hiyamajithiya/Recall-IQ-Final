@@ -7,6 +7,7 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView, SpectacularRedocView
+from core.views import admin_redirect_view, admin_login_redirect_view
 
 admin.site.site_header = "RecallIQ Admin"
 admin.site.site_title = "RecallIQ"
@@ -20,8 +21,12 @@ api_docs_patterns = [
 ]
 
 urlpatterns = [
-    # Admin interface
-    path('admin/', admin.site.urls),
+    # Admin interface - redirect to React app
+    path('admin/login/', admin_login_redirect_view, name='admin_login_redirect'),
+    path('admin/', admin_redirect_view, name='admin_redirect'),
+    
+    # Keep Django admin available at different URL for emergency access
+    path('django-admin/', admin.site.urls),
     
     # API Documentation
     path('api/', include(api_docs_patterns)),

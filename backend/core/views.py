@@ -2683,3 +2683,53 @@ def application_health(request):
             'status': 'unhealthy',
             'error': f'Application health check failed: {str(e)}'
         }, status=500)
+
+
+# Admin redirect views to handle Django admin access
+from django.shortcuts import redirect
+from django.http import HttpResponse
+
+def admin_redirect_view(request):
+    """
+    Smart redirect for Django admin access:
+    - If user is authenticated and is super_admin/support_team: allow Django admin access
+    - Otherwise: redirect to React app
+    """
+    # Check if user is authenticated and has admin privileges
+    if (request.user.is_authenticated and 
+        request.user.is_staff and 
+        hasattr(request.user, 'role') and 
+        request.user.role in ['super_admin', 'support_team']):
+        
+        # Let authenticated admin users access Django admin
+        from django.contrib import admin
+        return admin.site.index(request)
+    
+    # For unauthenticated users or non-admin users, redirect to React app
+    next_url = request.GET.get('next', '')
+    
+    if 'tenants' in next_url or 'admin' in next_url:
+        redirect_url = 'https://recalliq.chinmaytechnosoft.com/admin/dashboard'
+    else:
+        redirect_url = 'https://recalliq.chinmaytechnosoft.com/login'
+    
+    return redirect(redirect_url)
+
+
+def admin_login_redirect_view(request):
+    """
+    Smart redirect for Django admin login:
+    - If user is already authenticated and is admin: redirect to Django admin
+    - Otherwise: redirect to React app login
+    """
+    # Check if user is already authenticated and has admin privileges
+    if (request.user.is_authenticated and 
+        request.user.is_staff and 
+        hasattr(request.user, 'role') and 
+        request.user.role in ['super_admin', 'support_team']):
+        
+        # Already logged in admin user, redirect to Django admin
+        return redirect('/django-admin/')
+    
+    # Not authenticated or not admin, redirect to React login
+    return redirect('https://recalliq.chinmaytechnosoft.com/login')

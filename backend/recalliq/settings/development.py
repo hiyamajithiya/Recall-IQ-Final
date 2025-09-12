@@ -93,8 +93,14 @@ CACHES = {
     }
 }
 
+# Django Admin redirects to React app
+LOGIN_URL = 'https://recalliq.chinmaytechnosoft.com/login'
+LOGIN_REDIRECT_URL = 'https://recalliq.chinmaytechnosoft.com/admin/dashboard'
+LOGOUT_REDIRECT_URL = 'https://recalliq.chinmaytechnosoft.com/login'
+
 print(f"[DEV] Development settings loaded")
 print(f"[DEV] Database: SQLite ({DATABASES['default']['NAME']})")
 print(f"[DEV] Email Backend: {EMAIL_BACKEND}")
 print(f"[DEV] Celery Broker: {CELERY_BROKER_URL}")
 print(f"[DEV] Debug Mode: {DEBUG}")
+print(f"[DEV] Admin redirects configured to React app")
