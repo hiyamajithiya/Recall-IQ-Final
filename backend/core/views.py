@@ -178,11 +178,23 @@ def send_welcome_email(user, password=None, created_by=None):
    • Username: {user.username}"""
 
         if password:
-            credentials_section += f"""
-   • Temporary Password: {password}
+            # Check if this is a Google OAuth user by seeing if they have no password history
+            is_google_oauth = not hasattr(user, 'date_joined') or user.date_joined == user.last_login
+            if created_by is None and user.role == 'tenant_admin':
+                # This might be a Google OAuth signup
+                credentials_section += f"""
+   • Password: {password}
+   
+⚠️  SECURITY NOTICE FOR GOOGLE OAUTH USERS:
+   Since you signed up with Google OAuth, we've generated a secure password for your account.
+   You can continue using Google Sign-In OR use this password for regular login.
+   For enhanced security, please change this password after your first login."""
+            else:
+                credentials_section += f"""
+   • Password: {password}
    
 ⚠️  IMPORTANT SECURITY NOTICE:
-   Please log in immediately and change your temporary password for security reasons.
+   Please log in and change your password for security reasons.
    Your account access may be limited until you update your password."""
         else:
             credentials_section += f"""
@@ -501,9 +513,10 @@ class UserRegistrationView(generics.CreateAPIView):
     
     def perform_create(self, serializer):
         user = serializer.save()
+        password = self.request.data.get('password')  # Get the password from request data
         # Send welcome email for self-registration (async to not block user creation)
         try:
-            send_welcome_email(user, password=None, created_by=None)
+            send_welcome_email(user, password=password, created_by=None)
         except Exception as e:
             print(f"Welcome email failed for user {user.username}: {e}")
             # Continue user creation even if email fails
@@ -516,9 +529,10 @@ class TenantAdminRegistrationView(generics.CreateAPIView):
     
     def perform_create(self, serializer):
         user = serializer.save()
+        password = self.request.data.get('password')  # Get the password from request data
         # Send welcome email for new tenant admin with tenant details
         try:
-            send_welcome_email(user, password=None, created_by=None)
+            send_welcome_email(user, password=password, created_by=None)
         except Exception as e:
             print(f"Welcome email failed for tenant admin {user.username}: {e}")
             # Continue user creation even if email fails
@@ -543,10 +557,7 @@ def google_oauth_signup(request):
         if not google_token:
             return Response({'error': 'Google token is required'}, status=status.HTTP_400_BAD_REQUEST)
         
-        if not tenant_data:
-            return Response({'error': 'Tenant data is required'}, status=status.HTTP_400_BAD_REQUEST)
-        
-        # Verify Google token
+        # Verify Google token first (before checking tenant data)
         try:
             # You need to set GOOGLE_OAUTH_CLIENT_ID in settings
             client_id = getattr(settings, 'GOOGLE_OAUTH_CLIENT_ID', None)
@@ -571,30 +582,36 @@ def google_oauth_signup(request):
         existing_user = User.objects.filter(email=google_email).first()
         
         if existing_user:
-            # User exists - handle login
-            if not tenant_data:  # No tenant data means this is a login request
-                # Generate JWT tokens for existing user
-                refresh = RefreshToken.for_user(existing_user)
-                access_token = refresh.access_token
-                
-                return Response({
-                    'access': str(access_token),
-                    'refresh': str(refresh),
-                    'user': {
-                        'id': existing_user.id,
-                        'username': existing_user.username,
-                        'email': existing_user.email,
-                        'first_name': existing_user.first_name,
-                        'last_name': existing_user.last_name,
-                        'role': existing_user.role,
-                        'tenant_id': existing_user.tenant.id if existing_user.tenant else None,
-                        'tenant_name': existing_user.tenant.name if existing_user.tenant else None,
-                    },
-                    'message': 'Login successful via Google OAuth'
-                }, status=status.HTTP_200_OK)
-            else:
-                # User exists but trying to signup - this is an error
-                return Response({'error': 'User with this email already exists'}, status=status.HTTP_400_BAD_REQUEST)
+            # User exists - handle login (tenant_data not required for login)
+            # Generate JWT tokens for existing user
+            refresh = RefreshToken.for_user(existing_user)
+            access_token = refresh.access_token
+            
+            # Add custom claims
+            access_token['role'] = existing_user.role
+            if existing_user.tenant:
+                access_token['tenant_id'] = existing_user.tenant.id
+                access_token['tenant_name'] = existing_user.tenant.name
+            
+            return Response({
+                'access': str(access_token),
+                'refresh': str(refresh),
+                'user': {
+                    'id': existing_user.id,
+                    'username': existing_user.username,
+                    'email': existing_user.email,
+                    'first_name': existing_user.first_name,
+                    'last_name': existing_user.last_name,
+                    'role': existing_user.role,
+                    'tenant_id': existing_user.tenant.id if existing_user.tenant else None,
+                    'tenant_name': existing_user.tenant.name if existing_user.tenant else None,
+                },
+                'message': 'Login successful via Google OAuth'
+            }, status=status.HTTP_200_OK)
+        
+        # User doesn't exist - check if this is a login attempt (no tenant data)
+        if not tenant_data:
+            return Response({'error': 'The User with this account is not there'}, status=status.HTTP_400_BAD_REQUEST)
         
         # Validate tenant data
         required_fields = ['company_name', 'company_address', 'contact_person', 'contact_email', 'contact_phone']
@@ -636,6 +653,13 @@ def google_oauth_signup(request):
             tenant=tenant
         )
         
+        # Generate a temporary password for Google OAuth users
+        import secrets
+        import string
+        temp_password = ''.join(secrets.choice(string.ascii_letters + string.digits + '!@#$%') for _ in range(12))
+        user.set_password(temp_password)
+        user.save()
+        
         # Generate JWT tokens
         refresh = RefreshToken.for_user(user)
         access_token = refresh.access_token
@@ -645,9 +669,9 @@ def google_oauth_signup(request):
         access_token['tenant_id'] = user.tenant.id
         access_token['tenant_name'] = user.tenant.name
         
-        # Send welcome email
+        # Send welcome email with temporary password
         try:
-            send_welcome_email(user, password=None, created_by=None)
+            send_welcome_email(user, password=temp_password, created_by=None)
         except Exception as e:
             print(f"Welcome email failed for Google OAuth user {user.username}: {e}")
         
@@ -1127,7 +1151,8 @@ def verify_signup_otp(request):
             }
             
             user = User.objects.create_user(**user_data)
-            user.set_password(signup_data['password'])
+            signup_password = signup_data['password']  # Get the password from signup data
+            user.set_password(signup_password)
             user.save()
             
             # Mark OTP as used
@@ -1144,9 +1169,9 @@ def verify_signup_otp(request):
             access_token['tenant_id'] = user.tenant.id
             access_token['tenant_name'] = user.tenant.name
             
-            # Send welcome email
+            # Send welcome email with the password
             try:
-                send_welcome_email(user, password=None, created_by=None)
+                send_welcome_email(user, password=signup_password, created_by=None)
             except Exception as e:
                 print(f"Welcome email failed for user {user.username}: {e}")
             
